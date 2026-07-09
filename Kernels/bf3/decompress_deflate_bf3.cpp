@@ -23,6 +23,30 @@ static uint64_t bf3_decompress_deflate_max_buf_size = 16 * 1024;
 // spin lock to protect doca_buf_inventory_buf_get_by_addr
 pthread_spinlock_t buf_inventory_lock;
 
+// DOCA 3.0 dropped buf_reuse_by_data()/_by_addr() (in-place retarget); re-acquire instead.
+// with_data=true matches reuse_by_data, false matches reuse_by_addr (empty data segment).
+// Costs a per-submit inventory alloc/free under inv_lock, which reuse_by_* avoided.
+static doca_error_t bf3_rebind_doca_buf(struct doca_buf_inventory *inv, struct doca_mmap *mmap,
+                                        void *addr, size_t len, bool with_data,
+                                        struct doca_buf **buf, pthread_spinlock_t *inv_lock)
+{
+    doca_error_t ret;
+
+    if (*buf != nullptr)
+    {
+        ret = doca_buf_dec_refcount(*buf, NULL);
+        if (ret != DOCA_SUCCESS)
+            return ret;
+        *buf = nullptr;
+    }
+
+    pthread_spin_lock(inv_lock);
+    ret = with_data ? doca_buf_inventory_buf_get_by_data(inv, mmap, addr, len, buf)
+                    : doca_buf_inventory_buf_get_by_addr(inv, mmap, addr, len, buf);
+    pthread_spin_unlock(inv_lock);
+    return ret;
+}
+
 // Completion queues per DPM thread (consumed by bf3_decompress_deflate_kernel_poll).
 // Capacity is intentionally larger than HW depth to keep callback enqueue non-blocking.
 static constexpr size_t BF3_COMPLETION_QUEUE_CAPACITY = DPM_HW_KERNEL_QUEUE_SIZE + BF3_DECOMPRESS_DEFLATE_WORKQ_DEPTH;
@@ -558,7 +582,10 @@ dpkernel_error bf3_decompress_deflate_kernel_execute(dpkernel_task *task, int th
 
         // Fast-path retarget of preallocated buffers to current per-submit slice.
         // Keep descriptor reuse and avoid inventory alloc/free churn on the hot path.
-        ret = doca_buf_inventory_buf_reuse_by_data(dpk_task->src_doca_buf, in, dpk_task->in_size);
+        ret = bf3_rebind_doca_buf(bf3_decompress_deflate_state.global_doca_state->state.buf_inv,
+                                  bf3_decompress_deflate_state.global_doca_state->state.src_mmap,
+                                  in, dpk_task->in_size, /*with_data=*/true,
+                                  &dpk_task->src_doca_buf, &buf_inventory_lock);
         if (ret != DOCA_SUCCESS)
         {
             printf("bf3_decompress_deflate_kernel_execute failed to reuse src buffer: %s\n", doca_error_get_descr(ret));
@@ -566,7 +593,10 @@ dpkernel_error bf3_decompress_deflate_kernel_execute(dpkernel_task *task, int th
         }
 
         // For decompress destination: reset output window to [out, out_size] with empty data.
-        ret = doca_buf_inventory_buf_reuse_by_addr(dpk_task->dst_doca_buf, out, dpk_task->out_size);
+        ret = bf3_rebind_doca_buf(bf3_decompress_deflate_state.global_doca_state->state.buf_inv,
+                                  bf3_decompress_deflate_state.global_doca_state->state.dst_mmap,
+                                  out, dpk_task->out_size, /*with_data=*/false,
+                                  &dpk_task->dst_doca_buf, &buf_inventory_lock);
         if (ret != DOCA_SUCCESS)
         {
             printf("bf3_decompress_deflate_kernel_execute failed to reuse dst buffer: %s\n", doca_error_get_descr(ret));

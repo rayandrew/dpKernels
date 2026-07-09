@@ -22,6 +22,30 @@ static uint64_t bf3_aes_gcm_max_buf_size = 16 * 1024;
 // req_ctx-resident key bytes are used for key creation/caching, but buffers still come from DOCA input/output mmaps.
 static pthread_spinlock_t bf3_aes_gcm_buf_inventory_lock;
 
+// DOCA 3.0 dropped buf_reuse_by_data()/_by_addr() (in-place retarget); re-acquire instead.
+// with_data=true matches reuse_by_data, false matches reuse_by_addr (empty data segment).
+// Costs a per-submit inventory alloc/free under inv_lock, which reuse_by_* avoided.
+static doca_error_t bf3_rebind_doca_buf(struct doca_buf_inventory *inv, struct doca_mmap *mmap,
+                                        void *addr, size_t len, bool with_data,
+                                        struct doca_buf **buf, pthread_spinlock_t *inv_lock)
+{
+    doca_error_t ret;
+
+    if (*buf != nullptr)
+    {
+        ret = doca_buf_dec_refcount(*buf, NULL);
+        if (ret != DOCA_SUCCESS)
+            return ret;
+        *buf = nullptr;
+    }
+
+    pthread_spin_lock(inv_lock);
+    ret = with_data ? doca_buf_inventory_buf_get_by_data(inv, mmap, addr, len, buf)
+                    : doca_buf_inventory_buf_get_by_addr(inv, mmap, addr, len, buf);
+    pthread_spin_unlock(inv_lock);
+    return ret;
+}
+
 // Completion queues per DPM thread (consumed by bf3_aes_gcm_kernel_poll).
 static constexpr size_t BF3_AES_GCM_COMPLETION_QUEUE_CAPACITY = DPM_HW_KERNEL_QUEUE_SIZE + BF3_AES_GCM_WORKQ_DEPTH;
 static std::array<BoundedQueue<dpkernel_task *, BF3_AES_GCM_COMPLETION_QUEUE_CAPACITY>, N_DPM_THREADS>
@@ -655,8 +679,11 @@ dpkernel_error bf3_aes_gcm_kernel_execute(dpkernel_task *task, int thread_id)
     {
         // Fast-path retarget of preallocated buffers to current per-submit slice.
         // Keep descriptor reuse and avoid inventory alloc/free churn on the hot path.
-        doca_error_t src_reuse_ret =
-            doca_buf_inventory_buf_reuse_by_data(dpk_task->src_doca_buf, input_buffer, dpk_task->in_size);
+        doca_error_t src_reuse_ret = bf3_rebind_doca_buf(
+            bf3_aes_gcm_state.global_doca_state->state.buf_inv,
+            bf3_aes_gcm_state.global_doca_state->state.src_mmap,
+            (void *)input_buffer, dpk_task->in_size, /*with_data=*/true,
+            &dpk_task->src_doca_buf, &bf3_aes_gcm_buf_inventory_lock);
         if (src_reuse_ret != DOCA_SUCCESS)
         {
             printf("bf3 aes_gcm failed to reuse src buffer: %s\n", doca_error_get_descr(src_reuse_ret));
@@ -664,8 +691,11 @@ dpkernel_error bf3_aes_gcm_kernel_execute(dpkernel_task *task, int thread_id)
         }
 
         // For decrypt destination: reset output window to [output_buffer, out_size] with empty data.
-        doca_error_t dst_reuse_ret =
-            doca_buf_inventory_buf_reuse_by_addr(dpk_task->dst_doca_buf, output_buffer, dpk_task->out_size);
+        doca_error_t dst_reuse_ret = bf3_rebind_doca_buf(
+            bf3_aes_gcm_state.global_doca_state->state.buf_inv,
+            bf3_aes_gcm_state.global_doca_state->state.dst_mmap,
+            (void *)output_buffer, dpk_task->out_size, /*with_data=*/false,
+            &dpk_task->dst_doca_buf, &bf3_aes_gcm_buf_inventory_lock);
         if (dst_reuse_ret != DOCA_SUCCESS)
         {
             printf("bf3 aes_gcm failed to reuse dst buffer: %s\n", doca_error_get_descr(dst_reuse_ret));
